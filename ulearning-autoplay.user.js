@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东莞理工ulearning 自动倍速刷课脚本
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  自动倍速播放 ulearning.cn 视频课程，自动跳转下一节
 // @author       You
 // @match        https://ua.ulearning.cn/*
@@ -48,8 +48,8 @@
                     <option value="1">1x</option>
                     <option value="2">2x</option>
                     <option value="4">4x</option>
-                    <option value="8">8x</option>
-                    <option value="16" selected>16x</option>
+                    <option value="8" selected>8x</option>
+                    <option value="16">16x</option>
                   
                 </select>
             </div>
@@ -244,11 +244,60 @@
     }
 
     // ==================== 获取页面上的 viewProgress 值 ====================
+    // 优先：从平台 ViewModel 直接读取（window.test.currentPage → video element → viewProgress）
+    // 次选：DOM 选择器兜底
     function getViewProgress() {
-        const el = document.querySelector('[data-bind*="viewProgress"]');
-        if (!el) return null;
-        const val = parseFloat(el.textContent.trim());
-        return isNaN(val) ? null : val;
+        // 方式1：从平台 ViewModel 直接读取（最可靠，完全绕过 DOM 查询）
+        try {
+            const vm = window.test;
+            if (vm && typeof vm === 'object') {
+                const page = vm.currentPage ? vm.currentPage() : null;
+                if (page && page.pageElements) {
+                    const elements = page.pageElements();
+                    for (let i = 0; i < elements.length; i++) {
+                        const el = elements[i];
+                        // type == 4 为视频元素
+                        if (el.type && el.type() === 4) {
+                            const record = el.record ? el.record() : null;
+                            if (record && typeof record.viewProgress === 'function') {
+                                const vp = parseFloat(record.viewProgress());
+                                if (!isNaN(vp) && vp >= 0) {
+                                    log(`从ViewModel读取 viewProgress=${vp}`);
+                                    return vp;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            log('ViewModel读取失败:', e.message);
+        }
+
+        // 方式2：DOM 兜底（与 video 关联的 viewProgress 元素）
+        // 找当前正在播放的 video 元素的相邻 viewProgress 元素
+        const videos = document.querySelectorAll('video');
+        for (const video of videos) {
+            if (video.paused && video.ended === false && video.readyState < 2) continue;
+            // 向上查找包含 viewProgress 的容器
+            const container = video.closest('.pageElement, .video-wrapper, [id*="pageElement"]');
+            if (container) {
+                const el = container.querySelector('[data-bind*="viewProgress"]');
+                if (el) {
+                    const val = parseFloat(el.textContent.trim());
+                    if (!isNaN(val) && val >= 0) return val;
+                }
+            }
+        }
+
+        // 方式3：页面级 viewProgress（用于非视频页面的进度条）
+        const pageEl = document.querySelector('[data-bind*="pageElement.record().viewProgress"]');
+        if (pageEl) {
+            const val = parseFloat(pageEl.textContent.trim());
+            if (!isNaN(val) && val >= 0) return val;
+        }
+
+        return null;
     }
 
     // ==================== 视频卡顿（转圈加载）检测与修复 ====================
@@ -278,9 +327,9 @@
             if (timeElapsed >= STALL_THRESHOLD && Math.abs(progress - lastP) < 0.1) {
                 const nudged = stallNudgeCount.get(video) || 0;
                 if (nudged >= MAX_NUDGE) {
-                    log('卡顿修复次数已达上限，跳转下一节');
-                    updateStatus('⚠ 卡顿无法恢复，自动跳转下一节');
-                    if (CONFIG.autoNext) goToNextVideo();
+                    log('卡顿修复次数已达上限，暂停自动修复，等待正常看完');
+                    updateStatus('⚠ 卡顿多次无法恢复，请手动检查');
+                    stallNudgeCount.set(video, 0);  // 重置，等待 viewProgress 正常增长
                     return;
                 }
 
@@ -323,7 +372,9 @@
             if (timeElapsed >= STALL_THRESHOLD && Math.abs(currentT - lastT) < 0.5) {
                 const nudged = stallNudgeCount.get(video) || 0;
                 if (nudged >= MAX_NUDGE) {
-                    if (CONFIG.autoNext) goToNextVideo();
+                    log('降级模式卡顿修复次数已达上限，暂停修复');
+                    updateStatus('⚠ 视频卡住多次无法恢复，请手动检查');
+                    stallNudgeCount.set(video, 0);
                     return;
                 }
                 stallNudgeCount.set(video, nudged + 1);
@@ -340,21 +391,48 @@
     }
 
     // ==================== 已看完视频检测与跳过 ====================
+    const FINISHED_CONFIRM_COUNT = 3;  // 连续检测到 >= 95 的次数（防误判）
+    let finishConfirmCount = 0;        // 当前连续确认计数器
+    let finishConfirmEl = null;        // 确认来源的元素（用于判断是否为同一元素）
+    const finishConfirmThreshold = 95; // 平台判定"已看完"的阈值
+
     function isCurrentVideoFinished() {
-        // 方式1：直接读取 viewProgress 数值（最可靠，如 "38.4"）
+        // 方式1：直接读取 viewProgress 数值（最可靠）
         const progress = getViewProgress();
-        if (progress !== null && progress >= 95) {
-            info(`viewProgress=${progress} >= 95，已看完`);
-            return true;
+        const vpEl = document.querySelector('[data-bind*="viewProgress"]:not([style*="display:none"]):not([style*="display: none"])');
+
+        if (progress !== null) {
+            // 双重确认：在同一元素上连续多次检测到 >= 95 才认定完成
+            if (progress >= finishConfirmThreshold) {
+                if (finishConfirmEl === vpEl) {
+                    finishConfirmCount++;
+                    log(`viewProgress=${progress}，确认中 (${finishConfirmCount}/${FINISHED_CONFIRM_COUNT})`);
+                } else {
+                    finishConfirmCount = 1;
+                    finishConfirmEl = vpEl;
+                    log(`viewProgress=${progress}，开始确认`);
+                }
+                if (finishConfirmCount >= FINISHED_CONFIRM_COUNT) {
+                    info(`viewProgress=${progress} 连续确认 ${FINISHED_CONFIRM_COUNT} 次，已看完`);
+                    finishConfirmCount = 0;  // 重置
+                    finishConfirmEl = null;
+                    return true;
+                }
+            } else {
+                // viewProgress 下降（切章节后数值重置），重置计数
+                finishConfirmCount = 0;
+                finishConfirmEl = null;
+            }
         }
 
-        // 方式2：检测 DOM 中的"已看完"文本
+        // 方式2：检测 DOM 中的"已看完"文本（直接确认，无需双重）
         const finishedTexts = document.querySelectorAll(
             'span[data-bind*="finished"], .text span'
         );
         for (const el of finishedTexts) {
             const text = el.textContent.trim();
             if (text === '已看完' || text === 'Finished' || text === 'finished') {
+                info('检测到"已看完"文本标记');
                 return true;
             }
         }
@@ -367,6 +445,7 @@
             const style = bar.getAttribute('style') || '';
             const match = style.match(/width:\s*(\d+\.?\d*)%/);
             if (match && parseFloat(match[1]) >= 95) {
+                info(`进度条 width=${match[1]}%，已看完`);
                 return true;
             }
         }
@@ -519,11 +598,16 @@
 
         // 更新播放进度状态 + 卡顿检测
         video.addEventListener('timeupdate', () => {
-            const vp = getViewProgress();
-            const vpText = vp !== null ? ` | 进度${vp}%` : '';
             if (video.duration && isFinite(video.duration)) {
-                const progress = Math.round((video.currentTime / video.duration) * 100);
-                updateStatus(`▶ 播放中 ${progress}%${vpText} | ${formatTime(video.currentTime)}/${formatTime(video.duration)} | ${video.playbackRate}x`);
+                const vp = getViewProgress();
+                if (vp !== null) {
+                    // viewProgress 是平台真实进度，以此推算当前时间
+                    const realCurrentTime = (vp / 100) * video.duration;
+                    updateStatus(`▶ 播放中 ${vp.toFixed(1)}% | ${formatTime(realCurrentTime)}/${formatTime(video.duration)} | ${video.playbackRate}x`);
+                } else {
+                    const progress = ((video.currentTime / video.duration) * 100).toFixed(1);
+                    updateStatus(`▶ 播放中 ${progress}% | ${formatTime(video.currentTime)}/${formatTime(video.duration)} | ${video.playbackRate}x`);
+                }
             }
             checkVideoStall(video);
         });
@@ -540,7 +624,16 @@
     }
 
     // ==================== 自动下一节 ====================
+    const NEXT_COOLDOWN_MS = 8000;  // 跳转冷却 8 秒，防止重复触发
+    let lastNextTime = 0;
+
     function goToNextVideo() {
+        const now = Date.now();
+        if (now - lastNextTime < NEXT_COOLDOWN_MS) {
+            log(`跳转冷却中（${Math.ceil((NEXT_COOLDOWN_MS - (now - lastNextTime)) / 1000)}s），跳过`);
+            return;
+        }
+        lastNextTime = now;
         info('尝试跳转下一节...');
         updateStatus('⏭ 跳转下一节...');
 
