@@ -1,6 +1,7 @@
 # U-Learning 自动倍速刷课脚本
 
 适用于 [ua.ulearning.cn](https://ua.ulearning.cn/) 平台的油猴（Tampermonkey）脚本，自动倍速播放视频课程，自动跳转下一节，解放双手。
+
 油猴脚本地址：https://greasyfork.org/zh-CN/scripts/577154-%E4%B8%9C%E8%8E%9E%E7%90%86%E5%B7%A5ulearning-%E8%87%AA%E5%8A%A8%E5%80%8D%E9%80%9F%E5%88%B7%E8%AF%BE%E8%84%9A%E6%9C%AC
 ## 功能特性
 
